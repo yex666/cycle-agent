@@ -1001,54 +1001,159 @@ class LLMEngine:
         self.seqs = {}                                  # 所有序列的注册表
 ```
 
-### 4.2 一个请求的完整生命周期
+### 4.2 一个请求的完整生命周期（数据快照版）
+
+用一个最小的例子走完全程：`prompt="hi"`，假设字符 tokenizer 把它编码成 `[7, 8]`，`max_tokens=3`。全程只需 **3 个 engine step**（1 步 prefill + 2 步 decode）。
+
+先记住 Sequence 的全部字段（这就是"一个请求"的全部数据）：
+
+```python
+seq_id       # 请求编号
+prompt_ids   # 输入的token列表
+output_ids   # 生成的token列表
+cached_len   # 已写入KV cache的token数 / decode时=下一步要处理的位置
+phase        # "PREFILL" | "DECODE"
+state        # WAITING | RUNNING | FINISHED
+stop_reason  # None | "stop" | "length"
+```
+
+#### 阶段 0：add_request（请求出生）
+
+```python
+seq_id = engine.add_request("hi", SamplingParams(max_tokens=3))
+```
+
+add_request 内部：
+```python
+prompt_ids = tokenizer.encode("hi")   # → [7, 8]
+seq = Sequence(seq_id=0, prompt_ids=[7, 8], sampling_params=..., priority=...)
+self.seqs[0] = seq
+scheduler.add_sequence(seq)           # waiting = [seq0]
+```
+
+**快照**：
+```
+seq0: prompt_ids=[7,8]  output_ids=[]  cached_len=0  phase=PREFILL  state=WAITING  stop=None
+KV cache: (空)
+```
+
+#### 阶段 1：Step 1 —— prefill（第一次 step()）
+
+**schedule()（只规划，不计算）**：
+```
+waiting=[seq0], running=[]
+Phase A: running空 → 跳过
+Phase B1: running空 → 跳过
+Phase B2: 接纳seq0 → need = 2-0 = 2 → chunk = min(2, 512) = 2
+  waiting=[]  running=[seq0]  prefill_items=[(seq0, 2)]
+```
+
+**execute()（真正计算）**：
+```python
+# 处理 prefill 项 (seq0, 2)
+start    = seq0.cached_len = 0
+tokens   = all_ids[0:2] = [7, 8]        # prompt 的全部 2 个 token
+positions= [0, 1]
+_run_forward → model.forward([7,8], [0,1])   # 写位置0、1的KV
+seq0.cached_len = 0 + 2 = 2
+
+# 检查: 2 == num_tokens(2) → prefill 完成！
+seq0.phase = "DECODE"
+seq0.cached_len = 2 - 1 = 1              # decode约定（见4.3）
+_sample_and_apply(seq0, 1):
+  token = all_ids[1] = 8                 # 处理最后一个prompt token
+  forward([8], [1]) → 重写位置1的KV → seq0.cached_len = 1+1 = 2
+  采样 → 42 → output_ids = [42]
+  _apply_token: len(output_ids)=1 < max_tokens=3 → 不停止
+```
+
+**快照**：
+```
+seq0: prompt_ids=[7,8]  output_ids=[42]  cached_len=2  phase=DECODE  state=RUNNING  stop=None
+KV cache: 位置0(7) ✅  位置1(8) ✅
+```
+
+#### 阶段 2：Step 2 —— 第一次 decode
+
+**schedule()**：
+```
+running=[seq0]，seq0 已经是 DECODE
+Phase A: seq0 进 decode_items → decode_items=[seq0]
+```
+
+**execute()**：
+```python
+_sample_and_apply(seq0, cached_len=2):     # 处理位置2的token
+  token = all_ids[2] = 42                  # ← 位置2就是上一步采样出的42！
+  forward([42], [2]) → 写位置2的KV → seq0.cached_len = 2+1 = 3
+  采样 → 55 → output_ids = [42, 55]
+  _apply_token: len=2 < 3 → 不停止
+```
+
+**快照**：
+```
+seq0: prompt_ids=[7,8]  output_ids=[42,55]  cached_len=3  phase=DECODE  state=RUNNING  stop=None
+KV cache: 位置0(7) 位置1(8) 位置2(42) ✅
+```
+
+#### 阶段 3：Step 3 —— decode + 触发停止（请求死亡）
+
+**execute()**：
+```python
+_sample_and_apply(seq0, cached_len=3):
+  token = all_ids[3] = 55
+  forward([55], [3]) → 写位置3的KV → seq0.cached_len = 4
+  采样 → 9 → output_ids = [42, 55, 9]
+  _apply_token 检查:
+    len(output_ids)=3 >= max_tokens=3 → stop_reason = "length"
+  _finish(seq0):
+    register_prefix(seq0)   # 把prompt [7,8] 的KV块存入PrefixCache（供后续请求复用）
+    release(seq0)           # 释放物理块，还给空闲列表
+    state = FINISHED        # 从running移除
+```
+
+**快照**：
+```
+seq0: prompt_ids=[7,8]  output_ids=[42,55,9]  cached_len=4  phase=DECODE  state=FINISHED  stop="length"
+KV cache: 已释放，块回到空闲列表
+```
+
+#### 收尾：generate() 的循环
+
+`generate()` 就是不断 `step()` 直到 finished：
+
+```python
+def generate(self, prompt, sampling_params):
+    seq_id = self.add_request(prompt, sampling_params)   # 阶段0
+    seq = self.seqs[seq_id]
+    while not seq.is_finished:
+        self.step()                                      # 阶段1、2、3
+    return RequestOutput.from_sequence(seq, self.tokenizer)
+    # prompt="hi", text=decode([42,55,9]) ← 用户拿到的最终结果
+```
+
+#### 生命周期全景图
 
 ```
-1. 用户调用 engine.add_request("vLLM is")
-   → tokenizer.encode("vLLM is") → [116, 76, 76, 77, 0, 73, 83]
-   → 创建 Sequence(seq_id=0, prompt_ids=[...])
-   → scheduler.add_sequence(seq) → 放入 waiting 队列
-
-2. 循环调用 engine.step()
-
-   Step 1: schedule()
-     → waiting中有seq_0，running为空
-     → Phase B2: 接纳seq_0，分配block，prefill全部7个token
-     → 返回 ScheduledStep(prefill_items=[(seq_0, 7)])
-
-   execute(prefill_items=[(seq_0, 7)])
-     → model.forward(tokens=[116,76,76,77,0,73,83])
-       → 计算所有7个token的QKV
-       → 把KV写入物理块（通过block_manager.write_kv）
-       → paged_attention: 收集KV + 做注意力
-     → seq_0.cached_len = 7 (全部缓存了)
-     → seq_0.cached_len == seq_0.num_tokens → prefill完成！
-     → seq_0.phase = "DECODE"
-     → seq_0.cached_len -= 1  → 变成6（decode约定）
-     → 采样第一个输出token（比如 token=70, 即字母'f'）
-     → seq_0.output_ids = [70]
-
-   Step 2: schedule()
-     → running中有seq_0（in decode）
-     → Phase A: seq_0 decode 1个token
-     → 返回 ScheduledStep(decode_items=[seq_0])
-
-   execute(decode_items=[seq_0])
-     → model.forward(tokens=[70], positions=[6])
-       → 计算token 70 的 QKV
-       → 写入KV到位置6
-       → paged_attention: 收集位置0~6的KV + 做注意力
-     → 采样下一个token（比如 token=79, 即字母'o'）
-     → seq_0.output_ids = [70, 79]
-
-   ... 重复decode直到...
-
-   Step N: seq_0 生成了 EOS 或达到 max_tokens
-     → _finish(seq_0)
-     → block_manager.register_prefix(seq_0)  # 把prompt前缀存入PrefixCache
-     → block_manager.release(seq_0)          # 释放KV块
-     → seq_0.state = FINISHED
+add_request ─→ WAITING ──→ RUNNING(PREFILL) ──→ RUNNING(DECODE) ──→ FINISHED
+                 │              │                      │
+                 │         Phase B2 接纳         每步decode 1个token
+                 │         prefill全部/部分      直到触发停止条件
+                 │              │                      │
+                 │         cached_len ==            _finish():
+                 │         num_tokens                注册前缀缓存
+                 │         → 转DECODE+采样          释放KV块
+                 │                                   置FINISHED
 ```
+
+#### 六个关键点（对照上面看）
+
+1. **每一步 step() = schedule()（规划） + execute()（执行）**：前者只动队列和表格，后者才跑模型。
+2. **phase 只在 execute 里变**（PREFILL→DECODE），因为要等 forward 跑完才知道 `cached_len` 有没有凑满。
+3. **cached_len 的含义**：PREFILL 时 = 已写 KV 的 token 数；DECODE 时 = 下一步要处理的位置。
+4. **KV cache 的位置 = 序列的绝对位置**（prompt + 输出统一编号）：位置 0、1 是 prompt，位置 2 是第一个输出 token（42），位置 3 是 55……每个 token 的 KV 按它在整个序列中的位置存放。
+5. **停止检查在 `_apply_token`**：EOS / max_model_len / max_tokens / 停止字符串，任一命中就置 stop_reason。
+6. **死亡 = `_finish`**：前缀入缓存 → KV 块释放 → 状态置 FINISHED → 从 running 移除。块释放后物理空间立刻可以被其他请求使用。
 
 ### 4.3 prefill 和 decode 的统一处理
 
