@@ -1344,20 +1344,113 @@ def match_prefix(self, prompt_ids: List[int]):
     return 0, []  # 没命中
 ```
 
-**命中后的效果**：
+**命中后的效果**（最长前缀匹配）：
 
 ```
 请求A已完成: prompt = "You are a helpful assistant. Tell me about..."
-前缀缓存: {"You are a helpful assistant.": [block_3, block_7]}
+  → register_prefix(A): A 的【整个】prompt 都入缓存（token序列 → KV块列表）
+
+前缀缓存: {(A的完整prompt token序列): [block_3, block_7]}
 
 请求B到来: prompt = "You are a helpful assistant. What is vLLM?"
-match_prefix → 命中 27 个token的前缀
-→ attach_shared_blocks: seq_B 直接使用 block_3, block_7
-→ seq_B.cached_len = 27  ← 跳过27个token的prefill！
-→ 只需 prefill 剩余的 "What is vLLM?" 部分
+  match_prefix 做最长前缀匹配:
+    B 的前 27 个 token（"You are a helpful assistant."）与 A 相同 → 命中
+  → attach_shared_blocks: seq_B 复用 block_3, block_7
+  → seq_B.cached_len = 27  ← 跳过27个token的prefill！
+  → 只需 prefill 剩余的 "What is vLLM?" 部分
+
+注意: 不是"只缓存前半句"。A 的整个 prompt 都在缓存里，
+     能共享多少取决于两个请求的公共前缀有多长。
+     如果 B 的 prompt 与 A 完全相同 → prompt_remaining==0
+     → 完全跳过 prefill，直接进 decode（见 scheduler 的对应分支）。
 ```
 
 **注意**：只有 prompt 部分的块被缓存（不是生成内容），因为不同请求的生成内容不同，不应共享。
+
+#### 为什么需要前缀缓存：KV 块是动态的，会被覆盖
+
+容易误解的点："prompt 的 KV 不是本来就在 KV cache 里么，还要前缀缓存干嘛？"
+
+关键：**KV cache 的块是动态的——序列结束后就被释放，马上会被其他序列覆盖。** 不做前缀缓存，prompt 的 KV 很快就不存在了：
+
+```
+没有前缀缓存:
+  A 完成 → release(A) → A的块(含prompt KV)回空闲列表
+  B 到来 → allocate 拿到这个块 → 写入B的数据 → A的prompt KV 被覆盖！没了
+  C 用相同prompt到来 → 找不到 → 只能重新prefill（重新算一遍）
+
+有前缀缓存:
+  A 完成 → register_prefix: prompt部分的块 → 转给PrefixCache（引用+1，不被回收）
+          release: 序列放手（引用-1，但缓存仍持有）
+  块活着，数据还是A的prompt KV
+  C 用相同prompt到来 → match_prefix 命中 → 直接复用 → 跳过prefill
+```
+
+**前缀缓存不是"再复制一份 KV 数据"，而是用引用计数延长 KV 块的寿命。**
+
+#### 释放 ≠ 清数据：所有权转移
+
+`_finish` 的顺序（engine.py）：
+
+```python
+def _finish(self, seq):
+    if self.config.enable_prefix_caching and not seq.is_preempted:
+        self.block_manager.register_prefix(seq)   # ① 先登记前缀
+    self.block_manager.release(seq)               # ② 再释放
+    seq.state = FINISHED
+```
+
+用 4.2 的例子（seq0 的 prompt [7,8] 占物理块 5）：
+
+```
+register_prefix(seq0):
+  prefix_cache.put((7,8), [5])
+  allocator.touch(5)      # ref_count[5]: 1 → 2   （序列 + 缓存各持1）
+
+release(seq0):
+  allocator.free_block(5) # ref_count[5]: 2 → 1   （序列放手，缓存接手）
+  → ref != 0 → 块不回收！
+
+结果: 物理块5的数据还在（KV数值原封不动），owner 变成 PrefixCache
+```
+
+**"清除"的是序列的所有权，不是数据**。数据只在下次 allocate 分配该块、写入新 KV 时才被覆盖。系统从不清空内存（清内存很贵）。
+
+#### 运行时 KV Cache vs 前缀缓存
+
+| | 运行时 KV Cache (KVStore) | 前缀缓存 (PrefixCache) |
+|---|---|---|
+| 存什么 | **输入 + 全部生成**的 KV | 只存 **prompt（输入）** 部分的块 |
+| 给谁用 | 当前序列自己（decode 注意力要用） | 未来的新请求（跳过 prefill） |
+| 生命周期 | 序列存活期间持续增长 | 序列结束后仍保留（LRU 淘汰） |
+| 为什么生成部分也在 | decode 必须能看到自己生成过的 token | 生成是随机的，无跨请求复用价值 |
+
+#### 块的一生（生命周期全景）
+
+```
+allocate（分配，ref=1）
+   → 序列用（写入KV）
+   → 序列结束
+       ├─ 若是 prompt 部分的块:
+       │    register_prefix: 前缀缓存 +1 → release: 序列 -1 → ref=1（活着）
+       │    → 未来请求 match_prefix 命中 → touch +1 → 新序列用 → 结束 → release -1
+       │    → 一直活在缓存里，直到 LRU 淘汰 → ref=0 → 回空闲列表
+       └─ 若是生成部分的块:
+            release: ref 1→0 → 回空闲列表
+            → 下次 allocate 分配出去，新数据覆盖旧数据
+```
+
+#### 与厂商的"缓存命中"是同一个东西
+
+DeepSeek 的 Context Caching、Anthropic 的 Prompt Caching、OpenAI 的 Prompt Caching，本质就是 vLLM 的前缀缓存：
+
+- 相同前缀的 prompt → KV 直接复用 → 不重新算 prefill
+- 厂商对"命中缓存的输入 token"打折计费（DeepSeek 的 cache hit 输入价格约为 miss 的 1/10）
+- 你用同一个 system prompt（2000 token）发 10000 个请求——第一个请求算一次 prefill，后面 9999 个全部命中复用，省的是 GPU 计算
+
+#### 一句话总结
+
+> KV Cache 全程缓存所有 token（含生成），但块是动态的，序列结束就会被释放、被覆盖。前缀缓存 = 在序列结束的瞬间，用引用计数把 prompt 部分的块"救下来"，让它们活过所属序列、留给未来请求复用。它不加数据、不复制数据，只是改变 KV 块的所有权和生命周期——这正是厂商"缓存命中"的底层实现。
 
 ### 5.2 抢占 (Preemption)
 
